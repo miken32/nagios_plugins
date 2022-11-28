@@ -22,33 +22,36 @@
 name=$(basename "$0")
 usage="
 Usage:
-    $name -M <mode> -H <hostname> [-2] [-p <port>] [-C <community>] [-t transport] [-w <warning>] [-c <critical>] [-f]
-    $name -M <mode> -H <hostname> -3 -l <secName> [-t transport] [-L <protocolList>] [-x <authPassword>]
-        [-X <privPassword>] [-w <warning>] [-c <critical>] [-f]
+    $name -M <mode> -H <hostname> [-2] [-p <port>] [-C <community>] [-T transport] [-w <warning>] [-c <critical>]
+        [-t <timeout>] [-r <retry>] [-f] [-v]
+    $name -M <mode> -H <hostname> -l <secName> [-T transport] [-L <protocolList>] [-x <authPassword>]
+        [-X <privPassword>] [-w <warning>] [-c <critical>] [-t <timeout>] [-r <retry>] [-f] [-v]
     $name -h
 
     -M mode             Polling mode (failover, cpu, temp)
     -H hostname         Hostname
     -p port             SNMP port
-    -C community        SNMP version 1/2c community (default public)
-    -2                  Use SNMP version 2c (default 1)
-    -3                  Use SNMP version 3 (default 1)
-    -t transport        SNMP transport (udp, tcp, udp6, tcp6; default udp)
+    -C community        SNMP version 1/2c community
+    -2                  Use SNMP version 2c (instead of 1)
+    -T transport        SNMP transport (udp, tcp, udp6, tcp6; default udp)
     -l secName          SNMP v3 username
-    -L protocolList     SNMP v3 authentication, privacy protocols (default md5,des)
+    -L protocolList     SNMP v3 authentication, privacy protocols (default sha,aes)
     -x authPassword     SNMP v3 authentication password
     -X privPassword     SNMP v3 privacy password
     -w warning          Warning threshold for CPU (%) checks
     -c critical         Critical threshold for CPU (%) checks
+    -t timeout          Timeout in seconds
+    -r retry            Retry count
     -f                  Output performance data
+    -v                  Be verbose on stderr
     -h                  Help (print command usage and quit)
 "
 
 # set some defaults
 version="1"
-community="public"
+community=
 port="161"
-protocols="md5,des"
+protocols="sha,aes"
 transport="udp"
 snmp_opts=()
 message=""
@@ -56,25 +59,32 @@ ext_message=""
 exit="0"
 generate_perf_data="0"
 perf_data=""
+timeout=5
+retry=3
+verbose=0
 snmpget="/usr/bin/snmpget"
 snmpwalk="/usr/bin/snmpwalk"
 
-while getopts "M:H:p:C:23l:L:x:X:w:c:fh" option; do
+while getopts "M:H:p:C:2T:l:L:x:X:w:c:t:r:fvh" option; do
 	case $option in
 		M) mode=$OPTARG;;
 		H) hostname=$OPTARG;;
 		p) port=$OPTARG;;
-		2) version=2c;;
-		3) version=3;;
 		C) community=$OPTARG;;
+		2) version=2c;;
+		T) transport=$OPTARG;;
 		l) secName=$OPTARG;;
 		L) protocols=$OPTARG;;
 		x) authPassword=$OPTARG;;
 		X) privPassword=$OPTARG;;
 		w) warning=$OPTARG;;
 		c) critical=$OPTARG;;
+		t) timeout=$OPTARG;;
+		r) retry=$OPTARG;;
 		f) generate_perf_data=1;;
-		h) echo "$usage" && exit 3;;
+		v) (( verbose++ ));;
+		h) echo "$usage" && exit;;
+		*) echo "$usage" && exit 3;;
 	esac
 done
 
@@ -85,13 +95,15 @@ then
 	exit 3
 fi
 
-if [[ "$version" = "3" ]]; then
+if [[ "$version" = "1" ]] && [[ -z "$community" ]]; then
+	# haven't specified v2c and no community, assume they want v3
 	if [[ -z "$secName" ]]; then
-		echo "Unknown: Missing SNMP v3 security name"
+		echo "Unknown: Missing SNMP v3 security name or v1 community name"
 		echo "$usage"
 		exit 3
 	fi
-	snmp_opts=(${snmp_opts[@]} "-v" "$version" "-u" "$secName")
+	version=3
+	snmp_opts+=("-v" "$version" "-u" "$secName")
 	if [[ -z "$authPassword" ]]; then
 		secLevel="NoAuthNoPriv"
 	else
@@ -101,27 +113,51 @@ if [[ "$version" = "3" ]]; then
 			secLevel="AuthNoPriv"
 		else
 			secLevel="AuthPriv"
-			snmp_opts=(${snmp_opts[@]} "-x" "$privProtocol" "-X" "$privPassword")
+			snmp_opts+=("-x" "$privProtocol" "-X" "$privPassword")
 		fi
-		snmp_opts=(${snmp_opts[@]} "-l" "$secLevel" "-a" "$authProtocol" "-A" "$authPassword")
+		snmp_opts+=("-l" "$secLevel" "-a" "$authProtocol" "-A" "$authPassword")
 	fi
-	snmp_opts=(${snmp_opts[@]} "$transport:$hostname:$port")
 else
 	if [[ -z "$community" ]]; then
 		echo "Unknown: Missing community parameter"
 		echo "$usage"
 		exit 3
 	fi
-	snmp_opts=(${snmp_opts[@]} "-v" "$version" "-c" "$community" "$transport:$hostname:$port")
+	snmp_opts+=("-v" "$version" "-c" "$community")
 fi
+snmp_opts+=("-t" "$timeout" "-r" "$retry" "$transport:$hostname:$port")
+
+get_snmp() {
+	local cmd=$snmpget
+	local args=( "-OeqvU" "${snmp_opts[@]}" "$@" )
+	[[ $verbose -gt 0 ]] && printf "RUNNING:\n%s %s\n" "$cmd" "${args[*]}" >& 2
+	local result
+	result=$("$cmd" "${args[@]}")
+	local ex=$?
+	[[ $verbose -gt 1 ]] && printf "RESULT:\n%s\n" "$result" >& 2
+	printf "%s\n" "$result"
+	exit $ex
+}
+
+walk_snmp() {
+	local cmd=$snmpwalk
+	local args=( "${snmp_opts[@]}" "$@" )
+	[[ $verbose -gt 0 ]] && printf "RUNNING:\n%s %s\n" "$cmd" "${args[*]}" >& 2
+	local result
+	result=$("$cmd" "${args[@]}")
+	local ex=$?
+	[[ $verbose -gt 1 ]] && printf "RESULT:\n%s\n" "$result" >& 2
+	printf "%s\n" "$result"
+	exit $ex
+}
 
 if [[ "$mode" = "failover" ]]; then
 	failover_status=([3]=Down [4]=Error [9]=Active [10]=Standby)
 	mib_failover_prim=".1.3.6.1.4.1.9.9.147.1.2.1.1.1.3.6"
 	mib_failover_sec=".1.3.6.1.4.1.9.9.147.1.2.1.1.1.3.7"
 
-	status_prim=$($snmpget -OeqvU "${snmp_opts[@]}" "$mib_failover_prim")
-	status_sec=$($snmpget -OeqvU "${snmp_opts[@]}" "$mib_failover_sec")
+	status_prim=$(get_snmp "$mib_failover_prim")
+	status_sec=$(get_snmp "$mib_failover_sec")
 
 	if [[ "$status_prim" = "9" ]] && [[ "$status_sec" = "10" ]]; then
 		#primary active, secondary standby
@@ -166,7 +202,7 @@ elif [[ "$mode" = "cpu" ]]; then
 	check_mib=".1.3.6.1.4.1.9.9.109.1.1.1.1.7.1"
 	check_name="CPU usage"
 	check_unit="%"
-	metric=$($snmpget -OeqvU "${snmp_opts[@]}" "$check_mib" 2> /dev/null)
+	metric=$(get_snmp "$check_mib")
 	if [[ "$metric" =~ [^0-9] ]] || [[ -z "$metric" ]]; then
 		message=$(printf 'Unknown: %s' "$metric")
 		exit=3
@@ -193,7 +229,7 @@ elif [[ "$mode" = "temp" ]]; then
 	warning_count=0
 	unknown_count=0
 	# note we want to keep the OID in the output here
-	sensors=$($snmpwalk -Onq "${snmp_opts[@]}" "$sensor_mib" | awk -v mib="$sensor_mib." '/Temp/ {sub(mib,"",$1); print $0;}')
+	sensors=$(walk_snmp "-Onq" "$sensor_mib" | awk -v mib="$sensor_mib." '/Temp/ {sub(mib,"",$1); print $0;}')
 	while read -r sensor; do
 		if [[ -z "$sensor" ]]; then
 			message="Unknown: could not retrieve sensors"
@@ -210,21 +246,25 @@ elif [[ "$mode" = "temp" ]]; then
 		# CISCO-ENTITY-SENSOR-EXT-MIB::ceSensorExtThresholdValue
 		thresh_val_mib=".1.3.6.1.4.1.9.9.745.1.1.1.4.$index.1"
 
-		metric=$($snmpget -OeqvU "${snmp_opts[@]}" "$value_mib")
-		critical=$($snmpget -OeqvU "${snmp_opts[@]}" "$thresh_val_mib")
-		let warning=critical*75/100
+		metric=$(get_snmp "$value_mib")
+		# try to get the on-device critical level
+		critical_temp=$(get_snmp "$thresh_val_mib")
+		if [[ $critical_temp =~ ^[0-9]$ ]]; then
+			critical=critical_temp
+			(( warning = critical * 75 / 100 ))
+		fi
 		if [[ "$metric" =~ [^0-9] ]] || [[ -z "$metric" ]]; then
-			let unknown_count+=1
+			(( unknown_count += 1 ))
 			metric=0
 		elif [[ "$metric" -ge "$critical" ]]; then
-			let critical_count+=1
+			(( critical_count++ ))
 		elif [[ "$metric" -ge "$warning" ]]; then
-			let warning_count+=1
+			(( warning_count++ ))
 		fi
 		perf_data=$(printf '%ssensor%d=%d;%d;%d ' "$perf_data" "$index" "$metric" "$warning" "$critical")
 		ext_message=$(printf '%s\n%s %d%s\n' "$ext_message" "$desc" "$metric" "$check_unit")
-		let cumulative+=metric
-		let count+=1
+		(( cumulative += metric ))
+		(( count++ ))
 	done <<< "$sensors"
 	if [[ $count -gt 0 ]]; then
 		let metric=cumulative/count
