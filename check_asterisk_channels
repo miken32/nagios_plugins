@@ -22,62 +22,153 @@ oid=.1.3.6.1.4.1.22736.1.5.2
 
 usage="
 Usage:
-    $name -H <host> [-H <host>...] [-F <filter> [-d <field>]] [-w <warning>] [-c <critical>] [-f]
+    $name -H <host> [-H <host>...] [-p <port>] [-o oid] [-2] [-C <community>] [-F <filter> [-n] [-i <field>]] [-w <warning>] [-c <critical>] [-t <time>] [-r <retry>] [-f] [-d]
+    $name -H <host> [-H <host>...] [-p <port>] [-o oid] [-l <login>] [-L <proto>] [-x <pass>] [-X <pass>] [-F <filter> [-n] [-i <field>]] [-w <warning>] [-c <critical>] [-t <time>] [-r <retry>] [-f] [-d]
     $name -h
 
     -H host             The host to check; values from multiple hosts will be added together
-    -C comm             The SNMP community
+    -p port             The port to connect to (defaults to 161)
+    -o oid              The OID to check (defaults to $oid)
+    -C community        The SNMP v1/2c community (defaults to public)
+    -2                  Enable SNMP v2c
+	-T transport        SNMP transport (udp, tcp, udp6, tcp6; default udp)
     -F filter           If provided, only table entries with a regex match to the filter expression
                             will be counted
     -n                  Negates the filter command (i.e. count only table entries that do not match)
     -i field            If provided, the filter expression will only be checked against this
                             one-based field number
+    -l secName          SNMP v3 username
+    -L protocolList     SNMP v3 authentication, privacy protocols (default sha,aes)
+    -x authPassword     SNMP v3 authentication password
+    -X privPassword     SNMP v3 privacy password
     -w warning          Warning threshold for used channel count
     -c critical         Critical threshold for used channel count
+    -t timeout          Timeout in seconds (defaults to 5)
+    -r retry            Number of times to retry after timeout (defaults to 3)
     -f                  Output performance data
     -d                  Debug to STDERR
     -h                  Help (print command usage and quit)
 "
 
 # set some defaults
+version="1"
+community=
+port="161"
+protocols="sha,aes"
+transport="udp"
+snmp_opts=()
+message=""
+ext_message=""
+exit="0"
+generate_perf_data="0"
+perf_data=""
+timeout=5
+retry=3
+verbose=0
+snmpget="/usr/bin/snmpget"
+snmpwalk="/usr/bin/snmpwalk"
+
 declare -a hosts
-community=public
 filter=""
 negate=""
 field=0
 warning=5
 critical=10
 debug=0
-while getopts "H:C:F:ni:w:c:fdh" option; do
+
+while getopts "H:p:o:C:2T:F:ni:l:L:x:X:w:c:t:r:fdh" option; do
 	case "$option" in
 		H) hosts+=( "$OPTARG" );;
+		p) port="$OPTARG";;
+		o) oid="$OPTARG";;
 		C) community="$OPTARG";;
+		2) version="2c";;
+		T) transport="$OPTARG";;
 		F) filter="$OPTARG";;
 		n) negate="!";;
 		i) field="$OPTARG";;
+		l) secName="$OPTARG";;
+		L) protocols="$OPTARG";;
+		x) authPassword="$OPTARG";;
+		X) privPassword="$OPTARG";;
 		w) warning="$OPTARG";;
 		c) critical="$OPTARG";;
+		t) timeout="$OPTARG";;
+		r) retry="$OPTARG";;
 		f) generate_perf_data=1;;
-		d) debug=1;;
-		h) echo "$usage" && exit 3;;
+		d) (( debug++ ));;
+		h) echo "$usage" && exit;;
+		*) echo "$usage" && exit 3;;
 	esac
 done
 
-if [[ ${#hosts[@]} -eq 0 ]]; then
-	printf "UNKNOWN - No host specified\n"
+unknown() {
+	local msg=$1
+	shift
+	local args=( "$@" )
+	printf "UNKNOWN - $msg\n" "${args[@]}"
 	exit 3
+}
+
+if [[ ${#hosts[@]} -eq 0 ]]; then
+	unknown "No host specified"
 fi
 [[ $debug -gt 0 ]] && printf "Polling %d hosts: %s\n" "${#hosts[@]}" "${hosts[*]}" >&2
 
-if [[ ! "$field" =~ ^[0-9]+$ ]]; then
-	printf "UNKNOWN - Field must be a number\n"
-	exit 3
+if [[ $version -eq 3 ]]; then
+	if [[ -z $username ]] || [[ -z $authpass ]]; then
+		unknown "At least a username and authentication password are needed for SNMP v3"
+	fi
 fi
 
+for argname in port field warning critical timeout retry; do
+	if [[ ! $(eval "echo \$$argname") =~ ^[0-9]+$ ]]; then
+		unknown "The %s value must be a number" "$argname"
+	fi
+done
+
+if [[ -z $filter ]] && [[ $debug -gt 0 ]]; then
+	if [[ -n $negate ]] || [[ $field -gt 0 ]]; then
+		printf "Ignoring negation and field values without a filter\n" >&2
+	fi
+fi
+
+if [[ "$version" = "1" ]] && [[ -z "$community" ]]; then
+	# haven't specified v2c and no community, assume they want v3
+	if [[ -z "$secName" ]]; then
+		unknown "Missing SNMP v3 security name or v1 community name"
+	fi
+	version=3
+	snmp_opts+=("-v" "$version" "-u" "$secName")
+	if [[ -z "$authPassword" ]]; then
+		secLevel="NoAuthNoPriv"
+	else
+		if [[ ! $protocols =~ ^(md5|sha),[ad]es$ ]]; then
+			unknown "Protocols must be a comma separated list of two items"
+		else
+			authProtocol=${protocols%,*}
+			privProtocol=${protocols#*,}
+		fi
+		if [[ -z "$privPassword" ]]; then
+			secLevel="AuthNoPriv"
+		else
+			secLevel="AuthPriv"
+			snmp_opts+=("-x" "$privProtocol" "-X" "$privPassword")
+		fi
+		snmp_opts+=("-l" "$secLevel" "-a" "$authProtocol" "-A" "$authPassword")
+	fi
+else
+	if [[ -z "$community" ]]; then
+		unknown "Missing community parameter"
+	fi
+	snmp_opts+=("-v" "$version" "-c" "$community")
+fi
+snmp_opts+=("-t" "$timeout" "-r" "$retry")
+
 cmd1=snmptable
-declare -a args1=( "-c" "$community" "-Cf" "^" "-CH" )
+args1=( "${snmp_opts[@]}" "-Cf" "^" "-CH" )
 cmd2=wc
-declare -a args2=( "-l" )
+args2=( "-l" )
 
 if [[ -n "$filter" ]]; then
 	cmd2=awk
@@ -87,17 +178,16 @@ fi
 
 usage=0
 for host in "${hosts[@]}"; do
-	[[ $debug -gt 0 ]] && printf "Running command:\n%s %s %s %s | %s %s\n" \
-		"$cmd1" "${args1[*]}" "$host" "$oid" "$cmd2" "${args2[*]}" >&2
+	host="$transport:$host:$port"
+	[[ $debug -gt 0 ]] && printf "Running command:\n%s %s %s %s | %s %s\n" "$cmd1" "${args1[*]}" "$host" "$oid" "$cmd2" "${args2[*]}" >&2
 	temp=$($cmd1 "${args1[@]}" "$host" "$oid" | $cmd2 "${args2[@]}")
 	if [[ -z "$temp" ]]; then
-		printf "UNKNOWN - No response\n";
-		exit 3
+		unknown "No response";
 	fi
 	[[ $debug -gt 0 ]] && printf "Result: %s\n" "$temp"
 	usage=$(( usage + temp ))
 done
-	
+
 exitcode=0
 
 if [[ $usage -ge $critical ]]; then
