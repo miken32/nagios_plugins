@@ -1,0 +1,360 @@
+#!/usr/bin/php
+<?php
+
+$ticket_store_directory = "/var/tmp/icinga2";
+
+$opts = "H:P:z:u:p:t:w:c:fogvh";
+$long = [
+    "host:",
+    "port:",
+    "zone:",
+    "user:",
+    "password:",
+    "token:",
+    "warning:",
+    "critical:",
+    "performance",
+    "online",
+    "flagged",
+    "verbose",
+    "help",
+];
+
+$cli = getopt($opts, $long);
+
+$port = 8443;
+$verbose = 0;
+$user = "";
+$password = "";
+$token = "";
+$warning = null;
+$critical = null;
+$perfdata = false;
+$count_online = false;
+$count_flagged = false;
+
+foreach ($cli as $k => $v) {
+    switch ($k) {
+        case "host":
+        case "H":
+            $host = $v;
+            break;
+        case "port":
+        case "P":
+            $port = (int)$v;
+            break;
+        case "zone":
+        case "z":
+            $zone = $v;
+            break;
+        case "user":
+        case "u":
+            $user = $v;
+            break;
+        case "password":
+        case "p":
+            $password = $v;
+            break;
+        case "token":
+        case "t":
+            $token = $v;
+            break;
+        case "warning":
+        case "w":
+            $warning = $v;
+            break;
+        case "critical":
+        case "c":
+            $critical = $v;
+            break;
+        case "performance":
+        case "f":
+            $perfdata = true;
+            break;
+        case "online":
+        case "o":
+            $count_online = true;
+            break;
+        case "flagged":
+        case "g":
+            $count_flagged = true;
+            break;
+        case "verbose":
+        case "v":
+            if (is_array($v)) {
+                $verbose = count($v);
+            } else {
+                $verbose++;
+            }
+            break;
+        case "help":
+        case "h":
+            show_help();
+            break;
+        default:
+            show_help(3, "Invalid argument");
+            break;
+    }
+}
+
+if (empty($host)) {
+    show_help(3, "Hostname must be specified");
+}
+if (empty($zone) || !preg_match("/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[a-f0-9]{4}-[a-f0-9]{12}$/", $zone)) {
+    show_help(3, "Zone must be specified as a valid UUID v4");
+}
+if (
+    (empty($token) && (empty($user) || empty($password)))
+    || (!empty($token) && (!empty($user) || !empty($password)))
+) {
+    show_help(3, "You must specify either a username/password or token");
+}
+try {
+    if (!is_null($warning)) {
+        $warning = parse_threshold($warning);
+    }
+    if (!is_null($critical)) {
+        $critical = parse_threshold($critical);
+    }
+} catch (Exception $e) {
+    show_help(3, $e->getMessage());
+}
+
+if (!is_dir($ticket_store_directory)) {
+    if (!mkdir($ticket_store_directory, 0775, true)) {
+        error("Couldn't make ticket store directory $ticket_store_directory", 3);
+    }
+}
+
+$ticket = login($host, $port, $user, $password, $token);
+[$online, $flagged, $offline] = get_ap_data($host, $port, $zone, $ticket);
+if ($count_online && $count_flagged) {
+    $count = $online + $flagged;
+} elseif ($count_online) {
+    $count = $online;
+} elseif ($count_flagged) {
+    $count = flagged;
+} else {
+    $count = $offline;
+}
+
+if (!is_null($critical) && compare_threshold($critical, $count)) {
+    echo "CRITICAL";
+    $exit = 2;
+} elseif (!is_null($warning) && compare_threshold($warning, $count)) {
+    echo "WARNING";
+    $exit = 1;
+} else {
+    echo "OK";
+    $exit = 0;
+}
+if ($perfdata) {
+    echo " | online=$online flagged=$flagged offline=$offline\n";
+}
+exit($exit);
+
+
+
+function login(string $host, int $port, string $user = "", string $password = "", string $token = ""): string
+{
+    global $ticket_store_directory;
+
+    $hash = sha1("$host$port$user$password");
+    $store_file = "$ticket_store_directory/$hash";
+    $data = stat($store_file);
+    if ($data !== false && time() - $data["mtime"] < 3600) {
+
+        return file_get_contents($store_file);
+    }
+
+    $url = "https://$host:$port/wsg/api/public/v10_0/serviceTicket";
+    if ($token) {
+        // future implementation
+    } else {
+        $data = ["username" => $user, "password" => $password];
+    }
+
+    verbose("Connecting: $url");
+    try {
+        $stream = prep_json_post($url, $data);
+    } catch (Exception) {
+        $url = "https://$host:$port/wsg/api/public/v7_0/serviceTicket";
+        verbose("Connecting: $url");
+        $stream = prep_json_post($url, $data);
+    }
+    $response = stream_get_contents($stream);
+    verbose("Got response: $response", 2);
+
+    $data = json_decode($response, true);
+    if ($data["serviceTicket"]) {
+        file_put_contents($store_file, $data["serviceTicket"]);
+
+        return $data["serviceTicket"];
+    }
+
+    throw new Exception("No service ticket returned from SmartZone");
+}
+
+/**
+ * Get counts of AP states
+ *
+ * @return array an array containing counts of online APs, flagged APs, and offline APs
+ */
+function get_ap_data(string $host, int $port, string $zone, string $ticket): array
+{
+    $url = "https://$host:$port/wsg/api/public/v10_0/query/ap";
+    $query = http_build_query(["serviceTicket" => $ticket]);
+    $url .= "?$query";
+    $data = [
+        "filters" => [["type" => "ZONE", "value" => $zone]],
+        "limit" => 1000,
+    ];
+
+    verbose("Connecting: $url");
+    try {
+        $stream = prep_json_post("$url", $data);
+    } catch (Exception) {
+        $url = "https://$host:$port/wsg/api/public/v7_0/query/ap";
+        $url .= "?$query";
+        verbose("Connecting: $url");
+        $stream = prep_json_post("$url", $data);
+    }
+    $json = stream_get_contents($stream);
+    // this is big
+    verbose("Got response: $json", 5);
+    $data = json_decode($json, true);
+    verbose("Got $data[totalCount] records");
+    $states = array_column($data["list"], "status");
+    $online = array_filter($states, fn($v) => $v === "Online");
+    $flagged = array_filter($states, fn($v) => $v === "Flagged");
+    $offline = array_filter($states, fn($v) => $v === "Offline");
+
+    return [count($online), count($flagged), count($offline)];
+}
+
+function prep_json_post(string $url, array $data): mixed
+{
+    $opts = [
+        "http" => [
+            "method" => "POST",
+            "header" => ["Content-Type: application/json", "Connection: close"],
+            "content" => json_encode($data),
+        ],
+    ];
+    $ctx = stream_context_create($opts);
+    if (!$stream = fopen($url, "r", context: $ctx)) {
+        verbose("HTTP bad response data: " . json_encode($http_response_header), 3);
+        throw new Exception("Couldn't connect to host at $url");
+    }
+
+    return $stream;
+}
+
+/**
+ * Return a normalized threshold value (floats are converted to ints)
+ *
+ * @param string|int $thresh The threshold specification
+ * @return string The normalized threshold
+ * @throws Exception In case of invalid format
+ */
+function parse_threshold(mixed $thresh): string
+{
+    if (preg_match("/^[0-9]+$/", $thresh)) {
+        verbose("Threshold $thresh is an integer", 3);
+
+        return $thresh;
+    }
+    if (preg_match("/^([0-9]+)\.[0-9]+$/", $thresh, $matches)) {
+        verbose("Threshold $thresh is a float, returning integer", 3);
+
+        return $matches[1];
+    }
+    if (preg_match("/^(@?(?:[0-9]+|~))(?:\\.[0-9]+)?(?::(?:([0-9]+)(?:\\.[0-9]+)?)?)?$/", $thresh, $matches)) {
+        verbose("Threshold $thresh is a range '$matches[1]' to '$matches[2]'", 3);
+        if (count($matches) !== 3) {
+            return $matches[1];
+        }
+        if ($matches[1] === "~" || $matches[1] < $matches[2]) {
+
+            return "$matches[1]:$matches[2]";
+        }
+    }
+
+    throw new Exception("Invalid threshold format $thresh");
+}
+
+/**
+ * Checks to see if a value should trigger an alert based on a given threshold
+ * The threshold specification looks like [@][start:][end]
+ * 'start:end' means to alert if value is *outside* of the range
+ * 'start:' means end is infinity, effectively alert if below start
+ * 'end' means start is negative infinity, effectively alert if value is above end
+ * '~:end' is the same as omitting start
+ * a leading '@' means to invert the above definitions
+ *
+ * @see https://icinga.com/docs/icinga-2/2.11/doc/05-service-monitoring/#threshold-ranges
+ * @param string|int $thresh The threshold specification
+ * @param string|int $val The numeric value to compare against
+ * @return bool Whether or not an alert should be raised
+ */
+function compare_threshold(mixed $thresh, mixed $val): bool
+{
+    verbose("Evaluating '$thresh' with '$val'", 2);
+    $inverse = false;
+    $start = null;
+    $end = null;
+	if (str_starts_with($thresh, "@")) {
+        $inverse = true;
+        $thresh = trim($thresh, "@");
+    }
+    if (!str_contains($thresh, ":")) {
+        $end = (int)$thresh;
+    } else {
+        $vals = explode(":", $thresh);
+        $start = $vals[0] === "~" ? -INF : (int)$vals[0];
+        $end = $vals[1] === "" ? INF : (int)$vals[1];
+    }
+
+    return $inverse
+        ? $val <= $end && (is_null($start) || $val >= $start)
+        : $val > $end || (!is_null($start) && $val < $start);
+}
+
+function error(string $message, int $exit_code): void
+{
+    echo "$message\n\n";
+    exit($exit_code);
+}
+
+function verbose(string $message, int $level = 1): void
+{
+    global $verbose;
+    if ($verbose >= $level) {
+        file_put_contents("php://stderr", "$message\n");
+    }
+}
+
+function show_help(int $exit_code = 0, string $message = ""): void
+{
+    if ($message) {
+        $message .= "\n\n";
+    }
+    $message .= <<< 'EOF'
+      Usage:
+      -H, --host=HOST       The hostname to connect to
+      -P, --port=PORT       The port to use (defaults to 8443)
+      -z, --zone=ZONE       Which zone UUID to check
+      -u, --user=USER       The login username
+      -p, --password=PASS   The login password
+      -t, --token=TOKEN     The login token (instead of username/password)
+      -w, --warning=VALS    The warning value or range
+      -c, --critical=VALS   The critical value or range
+      -f, --performance     Output performance data
+      -v, --verbose         Increase verbosity
+      -h, --help            Show this usage info
+
+    EOF;
+
+    file_put_contents("php://stderr", $message);
+    exit($exit_code);
+}
