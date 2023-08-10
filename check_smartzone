@@ -1,9 +1,11 @@
 #!/usr/bin/php
 <?php
 
+declare(strict_types=1);
+
 $ticket_store_directory = "/var/tmp/icinga2";
 
-$opts = "H:P:z:u:p:t:w:c:fogvh";
+$opts = "H:P:z:u:p:t:w:c:foglvh";
 $long = [
     "host:",
     "port:",
@@ -16,6 +18,7 @@ $long = [
     "performance",
     "online",
     "flagged",
+    "list",
     "verbose",
     "help",
 ];
@@ -23,7 +26,7 @@ $long = [
 $cli = getopt($opts, $long);
 
 $port = 8443;
-$verbose = 0;
+$zone = "";
 $user = "";
 $password = "";
 $token = "";
@@ -32,6 +35,8 @@ $critical = null;
 $perfdata = false;
 $count_online = false;
 $count_flagged = false;
+$list_zones = false;
+$verbose = 0;
 
 foreach ($cli as $k => $v) {
     switch ($k) {
@@ -79,6 +84,10 @@ foreach ($cli as $k => $v) {
         case "g":
             $count_flagged = true;
             break;
+        case "list":
+        case "l":
+            $list_zones = true;
+            break;
         case "verbose":
         case "v":
             if (is_array($v)) {
@@ -100,8 +109,18 @@ foreach ($cli as $k => $v) {
 if (empty($host)) {
     show_help(3, "Hostname must be specified");
 }
-if (empty($zone) || !preg_match("/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[a-f0-9]{4}-[a-f0-9]{12}$/", $zone)) {
-    show_help(3, "Zone must be specified as a valid UUID v4");
+if ($list_zones === false) {
+    if ($zone === "") {
+        show_help(3, "You must specify at least one zone");
+    }
+    if (!is_array($zone)) {
+        $zone = [$zone];
+    }
+    foreach ($zone as $z) {
+        if (!valid_uuid($z)) {
+            show_help(3, "Zone must be specified as a valid UUID v4");
+        }
+    }
 }
 if (
     (empty($token) && (empty($user) || empty($password)))
@@ -110,12 +129,7 @@ if (
     show_help(3, "You must specify either a username/password or token");
 }
 try {
-    if (!is_null($warning)) {
-        $warning = parse_threshold($warning);
-    }
-    if (!is_null($critical)) {
-        $critical = parse_threshold($critical);
-    }
+    [$warning, $critical] = parse_wc($warning, $critical);
 } catch (Exception $e) {
     show_help(3, $e->getMessage());
 }
@@ -126,31 +140,57 @@ if (!is_dir($ticket_store_directory)) {
     }
 }
 
-$ticket = login($host, $port, $user, $password, $token);
-[$online, $flagged, $offline] = get_ap_data($host, $port, $zone, $ticket);
+try {
+    $ticket = login($host, $port, $user, $password, $token);
+    if ($list_zones) {
+        $zones = get_zone_data($host, $port, $ticket);
+        foreach ($zones as $uuid => $name) {
+            echo "$uuid    $name\n";
+        }
+        exit(0);
+    }
+    $online = $flagged = $offline = 0;
+    foreach ($zone as $z) {
+        [$temp1, $temp2, $temp3] = get_ap_data($host, $port, $z, $ticket);
+        $online += $temp1;
+        $flagged += $temp2;
+        $offline += $temp3;
+    }
+} catch (Exception $e) {
+    verbose("Exception: " . $e->getMessage());
+    echo "UNKNOWN";
+    exit(3);
+}
+
 if ($count_online && $count_flagged) {
     $count = $online + $flagged;
+    $desc = "online/flagged";
 } elseif ($count_online) {
     $count = $online;
+    $desc = "online";
 } elseif ($count_flagged) {
     $count = flagged;
+    $desc = "flagged";
 } else {
     $count = $offline;
+    $desc = "offline";
 }
 
 if (!is_null($critical) && compare_threshold($critical, $count)) {
-    echo "CRITICAL";
+    $result = "CRITICAL";
     $exit = 2;
 } elseif (!is_null($warning) && compare_threshold($warning, $count)) {
-    echo "WARNING";
+    $result = "WARNING";
     $exit = 1;
 } else {
-    echo "OK";
+    $result = "OK";
     $exit = 0;
 }
+printf("%s: %d %s APs", $result, $count, $desc);
 if ($perfdata) {
-    echo " | online=$online flagged=$flagged offline=$offline\n";
+    printf(" | online=%d flagged=%d offline=%d", $online, $flagged, $offline);
 }
+echo "\n";
 exit($exit);
 
 
@@ -161,7 +201,7 @@ function login(string $host, int $port, string $user = "", string $password = ""
 
     $hash = sha1("$host$port$user$password");
     $store_file = "$ticket_store_directory/$hash";
-    $data = stat($store_file);
+    $data = file_exists($store_file) ? stat($store_file) : false;
     if ($data !== false && time() - $data["mtime"] < 3600) {
 
         return file_get_contents($store_file);
@@ -232,6 +272,44 @@ function get_ap_data(string $host, int $port, string $zone, string $ticket): arr
     return [count($online), count($flagged), count($offline)];
 }
 
+/**
+ * Get a list of zones on the controller
+ *
+ * @return array<string, string> an associated array of zone descriptions indexed by UUID
+ */
+function get_zone_data(string $host, int $port, string $ticket): array
+{
+    $url = "https://$host:$port/wsg/api/public/v10_0/rkszones";
+    $query = http_build_query(["serviceTicket" => $ticket]);
+    $url .= "?$query";
+
+    verbose("Connecting: $url");
+    try {
+        $stream = prep_json_get("$url");
+    } catch (Exception) {
+        $url = "https://$host:$port/wsg/api/public/v7_0/rkszones";
+        $url .= "?$query";
+        verbose("Connecting: $url");
+        $stream = prep_json_get("$url");
+    }
+    $json = stream_get_contents($stream);
+    verbose("Got response: $json");
+    $data = json_decode($json, true);
+    verbose("Got $data[totalCount] records");
+    $uuids = array_column($data["list"], "id");
+    $descs = array_column($data["list"], "name");
+
+    return array_combine($uuids, $descs);
+}
+
+/**
+ * Prepare an HTTP stream with POST data
+ *
+ * @param string $url The URI
+ * @param array $data The POST data
+ * @return mixed A stream resource for use with stream_get_contents()
+ * @throws Exception
+ */
 function prep_json_post(string $url, array $data): mixed
 {
     $opts = [
@@ -241,13 +319,70 @@ function prep_json_post(string $url, array $data): mixed
             "content" => json_encode($data),
         ],
     ];
+
+    return open_stream($url, $opts);
+}
+
+/**
+ * Prepare an HTTP stream
+ *
+ * @param string $url The URI
+ * @return mixed A stream resource for use with stream_get_contents()
+ * @throws Exception
+ */
+function prep_json_get(string $url): mixed
+{
+    $opts = [
+        "http" => [
+            "header" => ["Content-Type: application/json", "Connection: close"],
+        ],
+    ];
+
+    return open_stream($url, $opts);
+}
+
+/**
+ * Prepares a stream for use
+ *
+ * @param string $url The URI
+ * @param array $opts Stream context options
+ * @return mixed A stream resource for use with stream_get_contents()
+ * @throws Exception
+ */
+function open_stream(string $url, array $opts = []): mixed
+{
+    $opts["http"]["timeout"] = getenv("DEFAULT_SOCKET_TIMEOUT") ?: ini_get("default_socket_timeout");
     $ctx = stream_context_create($opts);
-    if (!$stream = fopen($url, "r", context: $ctx)) {
-        verbose("HTTP bad response data: " . json_encode($http_response_header), 3);
+    if (!($stream = @fopen($url, "r", context: $ctx))) {
+        verbose("HTTP bad response data: " . json_encode($http_response_header ?? null), 3);
         throw new Exception("Couldn't connect to host at $url");
     }
 
     return $stream;
+}
+
+/**
+ * Parse the warning and critical values
+ *
+ * @param string|null $warning The warning value
+ * @param string|null $critical The critical value
+ * @return array<int, string|null> The warning and critical values
+ * @throws Exception In case of invalid format
+ */
+function parse_wc(?string $warning, ?string $critical): array
+{
+    if (!is_null($warning)) {
+        $warning = parse_threshold($warning);
+    }
+    if (!is_null($critical)) {
+        $critical = parse_threshold($critical);
+        if (is_numeric($warning) && is_numeric($critical) && $warning > $critical) {
+            verbose("Critical is less than warning, ignoring");
+            $critical = null;
+        }
+    }
+
+    return [$warning, $critical];
 }
 
 /**
@@ -257,7 +392,7 @@ function prep_json_post(string $url, array $data): mixed
  * @return string The normalized threshold
  * @throws Exception In case of invalid format
  */
-function parse_threshold(mixed $thresh): string
+function parse_threshold(string $thresh): string
 {
     if (preg_match("/^[0-9]+$/", $thresh)) {
         verbose("Threshold $thresh is an integer", 3);
@@ -272,6 +407,7 @@ function parse_threshold(mixed $thresh): string
     if (preg_match("/^(@?(?:[0-9]+|~))(?:\\.[0-9]+)?(?::(?:([0-9]+)(?:\\.[0-9]+)?)?)?$/", $thresh, $matches)) {
         verbose("Threshold $thresh is a range '$matches[1]' to '$matches[2]'", 3);
         if (count($matches) !== 3) {
+
             return $matches[1];
         }
         if ($matches[1] === "~" || $matches[1] < $matches[2]) {
@@ -292,12 +428,13 @@ function parse_threshold(mixed $thresh): string
  * '~:end' is the same as omitting start
  * a leading '@' means to invert the above definitions
  *
+ * @see https://nagios-plugins.org/doc/guidelines.html#THRESHOLDFORMAT
  * @see https://icinga.com/docs/icinga-2/2.11/doc/05-service-monitoring/#threshold-ranges
- * @param string|int $thresh The threshold specification
+ * @param string $thresh The threshold specification
  * @param string|int $val The numeric value to compare against
  * @return bool Whether or not an alert should be raised
  */
-function compare_threshold(mixed $thresh, mixed $val): bool
+function compare_threshold(string $thresh, string|int $val): bool
 {
     verbose("Evaluating '$thresh' with '$val'", 2);
     $inverse = false;
@@ -320,9 +457,14 @@ function compare_threshold(mixed $thresh, mixed $val): bool
         : $val > $end || (!is_null($start) && $val < $start);
 }
 
+function valid_uuid(string $uuid): bool
+{
+    return preg_match("/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[a-f0-9]{4}-[a-f0-9]{12}$/", $uuid) > 0;
+}
+
 function error(string $message, int $exit_code): void
 {
-    echo "$message\n\n";
+    file_put_contents("php://stderr", "$message\n\n");
     exit($exit_code);
 }
 
@@ -336,22 +478,29 @@ function verbose(string $message, int $level = 1): void
 
 function show_help(int $exit_code = 0, string $message = ""): void
 {
-    if ($message) {
+    if ($message !== "") {
         $message .= "\n\n";
     }
     $message .= <<< 'EOF'
       Usage:
       -H, --host=HOST       The hostname to connect to
       -P, --port=PORT       The port to use (defaults to 8443)
-      -z, --zone=ZONE       Which zone UUID to check
+      -z, --zone=ZONE       Which zone UUID to check; may be specified more than
+                            once, in which case values will be summed
       -u, --user=USER       The login username
       -p, --password=PASS   The login password
       -t, --token=TOKEN     The login token (instead of username/password)
       -w, --warning=VALS    The warning value or range
       -c, --critical=VALS   The critical value or range
+      -o, --online          Calculate warning and critical values relative to online
+                            AP count instead of offline; can be combined with -g
+      -g, --flagged         Calculate warning and critical values relative to flagged
+                            AP count instead of offline; can be combined with -o
       -f, --performance     Output performance data
+      -l, --list            Just get a list of zones
       -v, --verbose         Increase verbosity
       -h, --help            Show this usage info
+
 
     EOF;
 
