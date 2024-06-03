@@ -317,6 +317,7 @@ function prep_json_post(string $url, array $data): mixed
             "method" => "POST",
             "header" => ["Content-Type: application/json", "Connection: close"],
             "content" => json_encode($data),
+            "timeout" => 20,
         ],
     ];
 
