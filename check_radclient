@@ -42,6 +42,7 @@ my $send_count = 1;
 my $warn_thresh = 3;
 my $crit_thresh = 7;
 my $perfdata = 0;
+my $KEEP_ALL = 0;
 our $debug = 0;
 our $verbose = 0;
 
@@ -81,7 +82,15 @@ if (!$request_type) {
     show_usage(2);
 }
 
-($avhand, $avfile) = tempfile(UNLINK => $debug ? 0 : 1);
+if ($debug || $verbose > 2) {
+    $debug = 1;
+    $KEEP_ALL = 1;
+}
+if ($debug && $verbose < 3) {
+    $verbose = 3;
+}
+
+($avhand, $avfile) = tempfile();
 print_debug("File %s will not be removed at program exit", $avfile);
 while (my($key, $val) = each %avpairs) {
     $val =~ s/'/\\'/g;
@@ -100,7 +109,8 @@ print_debug(
 );
 
 if ( $request_type eq "auth" || $request_type eq "acct" || $request_type eq "status") {
-    $command = "$radclient_binary -$ipmode -q -f $avfile -c $send_count -r $retries -t $timeout $host:$port $request_type $secret";
+    my $verbosity = $debug ? "-x" : "-q";
+    $command = "$radclient_binary -$ipmode $verbosity -f $avfile -c $send_count -r $retries -t $timeout $host:$port $request_type $secret";
     print_debug("radclient command to send: %s", $command);
 } else {
     print_err("Unknown function %s passed, must be one of auth, acct, or status.", $request_type);
@@ -122,19 +132,20 @@ if ($elapsed >= $crit_thresh && $? == 0) {
 }
 
 printf(
-    "%s: Radius response time: %d secs, radclient exit code: %d",
+    "%s: Radius response time: %0.2f secs, radclient exit code: %d",
     $errindex, $elapsed, $? >> 8
 );
 
 if ($perfdata) {
     printf("|'radinterval'=%0.4fs;%d;%d", $elapsed, $warn_thresh, $crit_thresh);
 }
-
 print "\n";
 
 if ($verbose > 1) {
     printf("radclient output: %s", $cmd_output);
 }
+print "\n";
+
 exit $ERRORS{$errindex};
 
 sub print_debug
