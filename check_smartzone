@@ -217,7 +217,10 @@ function login(string $host, int $port, string $user = "", string $password = ""
     verbose("Connecting: $url");
     try {
         $stream = prep_json_post($url, $data);
-    } catch (Exception) {
+    } catch (Exception $e) {
+        if ($e->getCode() === 401) {
+            throw new Exception("Authentication error during login", 401);
+        }
         $url = "https://$host:$port/wsg/api/public/v7_0/serviceTicket";
         verbose("Connecting: $url");
         $stream = prep_json_post($url, $data);
@@ -353,10 +356,12 @@ function prep_json_get(string $url): mixed
 function open_stream(string $url, array $opts = []): mixed
 {
     $opts["http"]["timeout"] = getenv("DEFAULT_SOCKET_TIMEOUT") ?: ini_get("default_socket_timeout");
+    // $opts["http"]["ignore_errors"] = true;
     $ctx = stream_context_create($opts);
     if (!($stream = @fopen($url, "r", context: $ctx))) {
+        $status = (int)(explode(" ", $http_response_header[0])[1] ?? 0);
         verbose("HTTP bad response data: " . json_encode($http_response_header ?? null), 3);
-        throw new Exception("Couldn't connect to host at $url");
+        throw new Exception("Couldn't connect to host at $url", $status);
     }
 
     return $stream;
