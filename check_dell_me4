@@ -1,0 +1,373 @@
+#!/bin/env php
+<?php
+
+namespace RadiusOne\Icinga;
+
+use Exception;
+use GlobIterator;
+
+enum ExitCode: int
+{
+    case OK = 0;
+    case WARNING = 1;
+    case CRITICAL = 2;
+    case UNKNOWN = 3;
+}
+
+class DellMe4
+{
+    private const TOKEN_FILE_PREFIX = "check_dell_me4";
+    private const TOKEN_LIFETIME = 1500;
+
+    private string $session_key;
+    private string $url_base;
+
+    public function __construct(private $hostname, private string $username, private string $password, private int $debug_level = 0)
+    {
+        $this->url_base = "https://$hostname/api";
+        $this->login();
+    }
+
+    public function login(): void
+    {
+        foreach(new GlobIterator(sys_get_temp_dir() . "/" . self::TOKEN_FILE_PREFIX . "*") as $keyfile) {
+            if ($keyfile->getMTime() < time() - self::TOKEN_LIFETIME) {
+                $this->debug(2, "Deleting old key file %s", $keyfile->getRealPath());
+                unlink($keyfile->getRealPath());
+            } elseif (empty($this->session_key)) {
+                $this->debug(1, "Using key file %s", $keyfile->getRealPath());
+                $this->session_key = file_get_contents($keyfile->getRealPath());
+            }
+        }
+        if (empty($this->session_key)) {
+            $auth_hash = hash("sha256", sprintf("%s_%s", $this->username, $this->password));
+            $response = $this->get("/login/$auth_hash");
+            $this->session_key = $response["response"];
+            $writefile = tempnam(sys_get_temp_dir(), self::TOKEN_FILE_PREFIX);
+            $this->debug(1, "Saving session key %s to file %s", $this->session_key, $writefile);
+            file_put_contents($writefile, $this->session_key);
+        }
+    }
+
+    public function showControllers(): array
+    {
+        return $this->get("/show/controllers");
+    }
+
+    public function showDisks(): array
+    {
+        return $this->get("/show/disks");
+    }
+
+    public function showDiskGroups(): array
+    {
+        return $this->get("/show/disk-groups");
+    }
+
+    public function showEnclosure(): array
+    {
+        return $this->get("/show/enclosure");
+    }
+
+    public function showFans(): array
+    {
+        return $this->get("/show/fans");
+    }
+
+    public function showPowerSupplies(): array
+    {
+        return $this->get("/show/power-supplies");
+    }
+
+    public function showSystem(): array
+    {
+        return $this->get("/show/system");
+    }
+
+    public function get(string $url): array
+    {
+        $headers = [
+            "dataType" => "json",
+            "Content-Type" => "application/json",
+            "Accept" => "application/json",
+        ];
+        if (!empty($this->session_key)) {
+            $headers["sessionKey"] = $this->session_key;
+        }
+        $header = "";
+        foreach ($headers as $k => $v) {
+            $header .= sprintf("%s: %s\r\n", $k, $v);
+        }
+        $opts = ["http" => ["header" => $header]];
+        $ctx = stream_context_create($opts);
+        $url = $this->url_base . $url;
+        $this->debug(1, "Fetching %s authentication: %s", empty($this->session_key) ? "without" : "with", $url);
+        $http_response = file_get_contents($url, context: $ctx);
+        if ($http_response === false) {
+            throw new Exception(sprintf("Error getting URL %s", $url));
+        }
+        try {
+            $this->debug(2, "Got response: %s", $http_response);
+            $data = json_decode($http_response, flags: \JSON_THROW_ON_ERROR | \JSON_OBJECT_AS_ARRAY);
+            $this->debug(2, "Decoded response: %s", print_r($data, true));
+        } catch (JsonException $e) {
+            throw new Exception(sprintf("Error parsing response from %s. JSON error %s", $url, $e->getMessage()));
+        }
+
+        // strip the status entry, but note login *only* has a status entry
+        $status = $data["status"][0];
+        unset($data["status"]);
+
+        if ($status["response-type-numeric"] ?? 1 !== 0) {
+            throw new Exception(sprintf("Invalid response returned (%s: %s)", $status["response-type"] ?? "Unkown response type", $status["response"] ?? "No response data"));
+        }
+
+
+        return $data ?: $status;
+    }
+
+    private function debug(int $level, string $message, string|int ...$params): void
+    {
+        if ($level <= $this->debug_level) {
+            $message = trim($message) . "\n";
+            file_put_contents("php://stderr", vsprintf($message, $params));
+        }
+    }
+}
+
+$check_controllers = false;
+$check_disks = false;
+$check_diskgroups = false;
+$performance = false;
+$perfdata = [];
+$verbose = 0;
+
+$opts = get_opts();
+$command_opts = getopt(implode("", array_column($opts, 0)), array_column($opts, 1));
+foreach ($command_opts as $k => $v) {
+    switch ($k) {
+        case "host":
+        case "H":
+            $host = $v;
+            break;
+        case "username":
+        case "U":
+            $user = $v;
+            break;
+        case "password":
+        case "P":
+            $pass = $v;
+            break;
+        case "controllers":
+        case "c":
+            $check_controllers = true;
+            break;
+        case "disks":
+        case "d":
+            $check_disks = true;
+            break;
+        case "diskgroups":
+        case "g":
+            $check_diskgroups = true;
+            break;
+        case "performance":
+        case "f":
+            $performance = true;
+            break;
+        case "verbose":
+        case "v":
+            if (is_array($v)) {
+                $verbose = count($v);
+            } else {
+                $verbose++;
+            }
+            break;
+        case "help":
+        case "h":
+            show_help();
+        default:
+            show_help(ExitCode::UNKNOWN, "Invalid argument");
+    }
+}
+
+if (empty($host) || empty($user) || empty($pass)) {
+    show_help(ExitCode::UNKNOWN, "Hostname, username, and password must be specified");
+}
+
+try {
+    $api = new DellMe4($host, $user, $pass, $verbose);
+
+    $enclosure = $api->showEnclosure()["enclosures"][0];
+    $health = $enclosure["health-numeric"];
+    if ($health > 0) {
+        $exit = match($health) {
+            // Degraded
+            1 => ExitCode::WARNING,
+            // Fault
+            2 => ExitCode::CRITICAL,
+            // Unknown
+            3 => ExitCode::UNKNOWN,
+            // N/A
+            4 => ExitCode::UNKNOWN,
+            default => ExitCode::UNKNOWN,
+        };
+        terminate($exit, "Enclosure health: %s. %s", $enclosure["health-reason"], $enclosure["health-recommendation"]);
+    }
+
+    $supplies = $api->showPowerSupplies()["power-supplies"];
+    foreach ($supplies as $supply) {
+        $health = $supply["health-numeric"];
+        if ($health > 0) {
+            $exit = match($health) {
+                // Degraded
+                1 => ExitCode::WARNING,
+                // Fault
+                2 => ExitCode::CRITICAL,
+                // Unknown
+                3 => ExitCode::UNKNOWN,
+                // N/A
+                4 => ExitCode::UNKNOWN,
+                default => ExitCode::UNKNOWN,
+            };
+            terminate($exit, "Power supply health %s: %s. %s", $supply["location"], $supply["health-reason"], $supply["health-recommendation"]);
+        }        
+    }
+
+    $fans = $api->showFans()["fan"];
+    foreach ($fans as $fan) {
+        $perfdata[$fan["durable-id"]] = $fan["speed"];
+        $health = $fan["health-numeric"];
+        if ($health > 0) {
+            $exit = match($health) {
+                // Degraded
+                1 => ExitCode::WARNING,
+                // Fault
+                2 => ExitCode::CRITICAL,
+                // Unknown
+                3 => ExitCode::UNKNOWN,
+                // N/A
+                4 => ExitCode::UNKNOWN,
+                default => ExitCode::UNKNOWN,
+            };
+            terminate($exit, "Fan health %s: %s. %s", $fan["location"], $fan["health-reason"], $fan["health-recommendation"]);
+        }
+
+        $ses = $fan["status-ses-numeric"];
+        if ($ses !== 1) {
+            $exit = match($ses) {
+                // Unsupported
+                0 => ExitCode::UNKNOWN,
+                // Critical
+                2 => ExitCode::CRITICAL,
+                // Warning
+                3 => ExitCode::WARNING,
+                // Unrecoverable
+                4 => ExitCode::CRITICAL,
+                // Not Installed
+                5 => ExitCode::UNKNOWN,
+                // Unknown
+                6 => ExitCode::UNKNOWN,
+                // Unavailable
+                7 => ExitCode::UKNOWN,
+                default => ExitCode::UNKNOWN,
+            };
+            $ext = match(bindec($fan["extended-status"])) {
+                1 => "The device has reported a failure",
+                2 => "The device is off",
+                4 => "The device FRU is not installed",
+                8 => "The device status cannot be determined",
+                16 => "The device is requested to be on",
+                17 => "The device has failed",
+                18 => "The device is off",
+                19 => "The device has failed and is off",
+                24 => "Device status is unknown, possible I2C failure",
+                default => "No reason available",
+            };
+            terminate($exit, "Fan health %s: %s", $fan["location"], $ext);
+        }
+    }
+
+    $system = $api->showSystem()["system"][0];
+    $health = $system["health-numeric"];
+    if ($health > 0) {
+        $exit = match($health) {
+            // Degraded
+            1 => ExitCode::WARNING,
+            // Fault
+            2 => ExitCode::CRITICAL,
+            // Unknown
+            3 => ExitCode::UNKNOWN,
+            // N/A
+            4 => ExitCode::UNKNOWN,
+            default => ExitCode::UNKNOWN,
+        };
+        terminate($exit, "System health: %s. %s", $system["health-reason"], $system["health-recommendation"]);
+    }
+
+    $mcstatus = $system["other-MC-status-numeric"];
+    // documentation says 4749, but I get 4760
+    if ($mcstatus !== 4760 && $mcstatus !== 4749) {
+        $exit = match($health) {
+            // Not Communicating
+            1524 => ExitCode::WARNING,
+            // Not Operational
+            3231 => ExitCode::CRITICAL,
+            // Unknown
+            1496 => ExitCode::UNKNOWN,
+            default => ExitCode::UNKNOWN,
+        };
+        terminate($exit, "Other MC status: %s", $system["other-MC-status"]);
+    }
+
+    if ($check_controllers) {
+        $controllers = $api->showControllers();
+    }
+
+    if ($check_disks) {
+        $disks = $api->showDisks();
+    }
+
+    if ($check_diskgroups) {
+        $diskgroups = $api->showDiskGroups();
+    }
+
+    terminate(ExitCode::OK, "Health checks OK");
+} catch (Exception $e) {
+    terminate(ExitCode::UNKNOWN, $e->getMessage());
+}
+
+function terminate(ExitCode $exit, string $response, string|int ...$args): void
+{
+    $response = vsprintf($response, $args);
+    printf("%s: %s\n", $exit->name, trim($response));
+
+    exit($exit->value);
+}
+
+function get_opts(): array
+{
+    return [
+        ["H:", "hosts:",      "The controller's IP or hostname"],
+        ["U:", "username:",   "The username of an authorized user"],
+        ["P:", "password:",   "The authorized user's password"],
+        ["c",  "controllers", "Include controller checks"],
+        ["d",  "disks",       "Include disk checks"],
+        ["g",  "diskgroups",  "Include diskgroup checks"],
+        ["v",  "verbose",     "Show verbose output"],
+        ["f",  "performance", "Output performance data for graphing"],
+        ["h",  "help",        "Show help and exit"],
+    ];
+}
+
+function show_help(ExitCode $exit = ExitCode::OK, string $message = null): void
+{
+    $message ??= "Check system health of a Dell ME4 storage unit";
+    printf("%s\n\n", trim($message));
+    $opts = get_opts();
+    foreach ($opts as $opt) {
+        printf("-%s, --%-20s %s\n", trim($opt[0], ":"), trim($opt[1], ":"), $opt[2]);
+    }
+    echo "\n";
+
+    exit($exit->value);
+}
