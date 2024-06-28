@@ -359,7 +359,7 @@ function open_stream(string $url, array $opts = []): mixed
     // $opts["http"]["ignore_errors"] = true;
     $ctx = stream_context_create($opts);
     if (!($stream = @fopen($url, "r", context: $ctx))) {
-        $status = (int)(explode(" ", $http_response_header[0])[1] ?? 0);
+        $status = (int)(explode(" ", $http_response_header[0] ?? "0 0")[1] ?? 0);
         verbose("HTTP bad response data: " . json_encode($http_response_header ?? null), 3);
         throw new Exception("Couldn't connect to host at $url", $status);
     }
