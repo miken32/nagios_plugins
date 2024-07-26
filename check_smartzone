@@ -149,7 +149,7 @@ try {
             echo $out;
             echo str_repeat("-", strlen($out)) . "\n";
         }
-        $zones = get_zone_data($host, $port, $ticket);
+        $zones = get_zone_data($url_base, $ticket);
         foreach ($zones as $uuid => $name) {
             echo "$uuid    $name\n";
         }
@@ -157,7 +157,7 @@ try {
     }
     $online = $flagged = $offline = 0;
     foreach ($zone as $z) {
-        [$temp1, $temp2, $temp3] = get_ap_data($host, $port, $z, $ticket);
+        [$temp1, $temp2, $temp3] = get_ap_data($z, $url_base, $ticket);
         $online += $temp1;
         $flagged += $temp2;
         $offline += $temp3;
@@ -221,21 +221,22 @@ function login(string $host, int $port, string $user = "", string $password = ""
         $data = ["username" => $user, "password" => $password];
     }
 
-    verbose("Connecting: $url");
-    try {
-        $stream = prep_json_post($url, $data);
-    } catch (Exception $e) {
-        if ($e->getCode() === 401) {
-            throw new Exception("Authentication error during login", 401);
-        }
-        $url = "https://$host:$port/wsg/api/public/v7_0/serviceTicket";
+    foreach (["v12_0", "v10_0", "v7_0"] as $version) {
+        $url = "https://$host:$port/wsg/api/public/$version/serviceTicket";
         verbose("Connecting: $url");
-        $stream = prep_json_post($url, $data);
+        try {
+            $stream = prep_json_post($url, $data);
+            $response = stream_get_contents($stream);
+            verbose("Got response: $response", 2);
+            $data = json_decode($response, associative: true, flags: JSON_THROW_ON_ERROR);
+            break;
+        } catch	(Exception $e) {
+            if ($e->getCode() === 401) {
+                throw new Exception("Authentication error during login", 401, $e);
+            }
+        }
     }
-    $response = stream_get_contents($stream);
-    verbose("Got response: $response", 2);
 
-    $data = json_decode($response, true);
     if ($data["serviceTicket"]) {
         $base_url = str_replace("/serviceTicket", "", $url);
         file_put_contents($store_file, $data["serviceTicket"] . "|" . $base_url);
@@ -251,29 +252,21 @@ function login(string $host, int $port, string $user = "", string $password = ""
  *
  * @return array an array containing counts of online APs, flagged APs, and offline APs
  */
-function get_ap_data(string $host, int $port, string $zone, string $ticket): array
+function get_ap_data(string $zone, string $base_url, string $ticket): array
 {
-    $url = "https://$host:$port/wsg/api/public/v10_0/query/ap";
+    $url = "$base_url/query/ap";
     $query = http_build_query(["serviceTicket" => $ticket]);
     $url .= "?$query";
     $data = [
         "filters" => [["type" => "ZONE", "value" => $zone]],
         "limit" => 1000,
     ];
-
     verbose("Connecting: $url");
-    try {
-        $stream = prep_json_post("$url", $data);
-    } catch (Exception) {
-        $url = "https://$host:$port/wsg/api/public/v7_0/query/ap";
-        $url .= "?$query";
-        verbose("Connecting: $url");
-        $stream = prep_json_post("$url", $data);
-    }
+    $stream = prep_json_post($url, $data);
     $json = stream_get_contents($stream);
     // this is big
     verbose("Got response: $json", 5);
-    $data = json_decode($json, true);
+    $data = json_decode($json, associative: true, flags: JSON_THROW_ON_ERROR);
     verbose("Got $data[totalCount] records");
     $states = array_column($data["list"], "status");
     $online = array_filter($states, fn($v) => $v === "Online");
@@ -288,21 +281,14 @@ function get_ap_data(string $host, int $port, string $zone, string $ticket): arr
  *
  * @return array<string, string> an associated array of zone descriptions indexed by UUID
  */
-function get_zone_data(string $host, int $port, string $ticket): array
+function get_zone_data(string $url_base, string $ticket): array
 {
-    $url = "https://$host:$port/wsg/api/public/v10_0/rkszones";
+    $url = "$url_base/rkszones";
     $query = http_build_query(["serviceTicket" => $ticket]);
     $url .= "?$query";
 
     verbose("Connecting: $url");
-    try {
-        $stream = prep_json_get("$url");
-    } catch (Exception) {
-        $url = "https://$host:$port/wsg/api/public/v7_0/rkszones";
-        $url .= "?$query";
-        verbose("Connecting: $url");
-        $stream = prep_json_get("$url");
-    }
+    $stream = prep_json_get("$url");
     $json = stream_get_contents($stream);
     verbose("Got response: $json");
     $data = json_decode($json, true);
