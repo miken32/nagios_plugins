@@ -13,7 +13,6 @@ $long = [
     "zone:",
     "user:",
     "password:",
-    "token:",
     "warning:",
     "critical:",
     "performance",
@@ -30,7 +29,6 @@ $port = 8443;
 $zone = "";
 $user = "";
 $password = "";
-$token = "";
 $warning = null;
 $critical = null;
 $perfdata = false;
@@ -60,10 +58,6 @@ foreach ($cli as $k => $v) {
         case "password":
         case "p":
             $password = $v;
-            break;
-        case "token":
-        case "t":
-            $token = $v;
             break;
         case "warning":
         case "w":
@@ -123,11 +117,8 @@ if ($list_zones === false) {
         }
     }
 }
-if (
-    (empty($token) && (empty($user) || empty($password)))
-    || (!empty($token) && (!empty($user) || !empty($password)))
-) {
-    show_help(3, "You must specify either a username/password or token");
+if (empty($user) || empty($password)) {
+    show_help(3, "You must specify both a username and password");
 }
 try {
     [$warning, $critical] = parse_wc($warning, $critical);
@@ -142,7 +133,7 @@ if (!is_dir(TICKET_STORE_DIR)) {
 }
 
 try {
-    $ticket = login($host, $port, $user, $password, $token, $url_base);
+    $ticket = login($host, $port, $user, $password, $url_base);
     if ($list_zones) {
         echo "\n";
         if (!empty($url_base)) {
@@ -202,7 +193,7 @@ exit($exit);
 
 
 
-function login(string $host, int $port, string $user = "", string $password = "", string $token = "", ?string &$base_url = null): string
+function login(string $host, int $port, string $user = "", string $password = "", ?string &$base_url = null): string
 {
     $hash = sha1("$host$port$user$password");
     $store_file = TICKET_STORE_DIR . "/$hash";
@@ -213,11 +204,7 @@ function login(string $host, int $port, string $user = "", string $password = ""
         return $ticket;
     }
 
-    if ($token) {
-        // future implementation
-    } else {
-        $data = ["username" => $user, "password" => $password];
-    }
+    $data = ["username" => $user, "password" => $password];
 
     foreach (API_VERSIONS as $version) {
         $url = "https://$host:$port/wsg/api/public/v$version/serviceTicket";
@@ -487,7 +474,6 @@ function show_help(int $exit_code = 0, string $message = ""): void
                             once, in which case values will be summed
       -u, --user=USER       The login username
       -p, --password=PASS   The login password
-      -t, --token=TOKEN     The login token (instead of username/password)
       -w, --warning=VALS    The warning value or range
       -c, --critical=VALS   The critical value or range
       -o, --online          Calculate warning and critical values relative to online
