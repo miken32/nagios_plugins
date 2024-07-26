@@ -141,8 +141,14 @@ if (!is_dir($ticket_store_directory)) {
 }
 
 try {
-    $ticket = login($host, $port, $user, $password, $token);
+    $ticket = login($host, $port, $user, $password, $token, $url_base);
     if ($list_zones) {
+        echo "\n";
+        if (!empty($url_base)) {
+            $out = sprintf("API URL base is %s\n", $url_base);
+            echo $out;
+            echo str_repeat("-", strlen($out)) . "\n";
+        }
         $zones = get_zone_data($host, $port, $ticket);
         foreach ($zones as $uuid => $name) {
             echo "$uuid    $name\n";
@@ -195,7 +201,7 @@ exit($exit);
 
 
 
-function login(string $host, int $port, string $user = "", string $password = "", string $token = ""): string
+function login(string $host, int $port, string $user = "", string $password = "", string $token = "", ?string &$base_url = null): string
 {
     global $ticket_store_directory;
 
@@ -203,8 +209,9 @@ function login(string $host, int $port, string $user = "", string $password = ""
     $store_file = "$ticket_store_directory/$hash";
     $data = file_exists($store_file) ? stat($store_file) : false;
     if ($data !== false && time() - $data["mtime"] < 3600) {
+        [$ticket, $base_url] = explode("|", file_get_contents($store_file));
 
-        return file_get_contents($store_file);
+        return $ticket;
     }
 
     $url = "https://$host:$port/wsg/api/public/v10_0/serviceTicket";
@@ -230,7 +237,8 @@ function login(string $host, int $port, string $user = "", string $password = ""
 
     $data = json_decode($response, true);
     if ($data["serviceTicket"]) {
-        file_put_contents($store_file, $data["serviceTicket"]);
+        $base_url = str_replace("/serviceTicket", "", $url);
+        file_put_contents($store_file, $data["serviceTicket"] . "|" . $base_url);
 
         return $data["serviceTicket"];
     }
