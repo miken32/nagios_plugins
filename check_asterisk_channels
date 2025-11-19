@@ -31,7 +31,7 @@ Usage:
     -o oid              The OID to check (defaults to $oid)
     -C community        The SNMP v1/2c community (defaults to public)
     -2                  Enable SNMP v2c
-	-T transport        SNMP transport (udp, tcp, udp6, tcp6; default udp)
+    -T transport        SNMP transport (udp, tcp, udp6, tcp6; default udp)
     -F filter           If provided, only table entries with a regex match to the filter expression
                             will be counted
     -n                  Negates the filter command (i.e. count only table entries that do not match)

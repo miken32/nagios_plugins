@@ -104,6 +104,12 @@ foreach ($cli as $k => $v) {
 if (empty($host)) {
     show_help(3, "Hostname must be specified");
 }
+if (is_array($host)) {
+    show_help(3, "Hostname must not be specified more than once");
+}
+if (empty($port)) {
+    show_help(3, "Invalid port number");
+}
 if ($list_zones === false) {
     if ($zone === "") {
         show_help(3, "You must specify at least one zone");
@@ -117,8 +123,8 @@ if ($list_zones === false) {
         }
     }
 }
-if (empty($user) || empty($password)) {
-    show_help(3, "You must specify both a username and password");
+if (empty($user) || empty($password) || !is_string($user) || !is_string($password)) {
+    show_help(3, "You must specify both a username and password once");
 }
 try {
     [$warning, $critical] = parse_wc($warning, $critical);
