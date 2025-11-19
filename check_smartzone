@@ -142,8 +142,12 @@ try {
             echo str_repeat("-", strlen($out)) . "\n";
         }
         $zones = get_zone_data($url_base, $ticket);
-        foreach ($zones as $uuid => $name) {
-            echo "$uuid    $name\n";
+        $nlen = max(array_map(fn ($z) => strlen($z[0]), $zones));
+        $flen = max(array_map(fn ($z) => strlen($z[1] ?? ""), $zones));
+        foreach ($zones as $uuid => $data) {
+            $name = str_pad($data[0], $nlen);
+            $fw = str_pad($data[1] ?? "", $flen);
+            echo "$uuid\t$name\t$fw\n";
         }
         exit(0);
     }
@@ -273,15 +277,44 @@ function get_zone_data(string $url_base, string $ticket): array
     $url .= "?$query";
 
     verbose("Connecting: $url");
-    $stream = prep_json_get("$url");
+    $stream = prep_json_get($url);
     $json = stream_get_contents($stream);
     verbose("Got response: $json");
     $data = json_decode($json, true);
     verbose("Got $data[totalCount] records");
+/*
     $uuids = array_column($data["list"], "id");
     $descs = array_column($data["list"], "name");
 
     return array_combine($uuids, $descs);
+*/
+
+    $returns = [];
+    foreach ($data["list"] as $zone) {
+        $zone_id = $zone["id"];
+        $returns[$zone_id] = [$zone["name"]];
+        $url = "$url_base/rkszones/$zone_id/apFirmware";
+        $url .= "?$query";
+        verbose("Connecting: $url");
+        try {
+            $stream = prep_json_get($url);
+            $json = stream_get_contents($stream);
+        } catch (Exception) {
+            continue;
+        }
+        verbose("Got response: $json");
+        $data = json_decode($json, true);
+        verbose("Got $data[totalCount] records");
+        foreach ($data["list"] as $fwentry) {
+            if ($fwentry["supported"]) {
+                $fw = $fwentry["firmwareVersion"];
+            }
+        }
+        $returns[$zone_id][] = ($fw ?? "");
+    }
+   uasort($returns, fn (array $a, array $b) => $a[0] <=> $b[0]);
+
+    return $returns;
 }
 
 /**
@@ -317,7 +350,7 @@ function prep_json_get(string $url): mixed
 {
     $opts = [
         "http" => [
-            "header" => ["Content-Type: application/json", "Connection: close"],
+            "header" => ["Accept: application/json", "Connection: close"],
         ],
     ];
 
@@ -334,7 +367,7 @@ function prep_json_get(string $url): mixed
  */
 function open_stream(string $url, array $opts = []): mixed
 {
-    $opts["http"]["timeout"] = getenv("DEFAULT_SOCKET_TIMEOUT") ?: ini_get("default_socket_timeout");
+    $opts["http"]["timeout"] ??= getenv("DEFAULT_SOCKET_TIMEOUT") ?: ini_get("default_socket_timeout");
     // $opts["http"]["ignore_errors"] = true;
     $ctx = stream_context_create($opts);
     if (!($stream = @fopen($url, "r", context: $ctx))) {
