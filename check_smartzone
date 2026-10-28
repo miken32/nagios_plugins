@@ -206,7 +206,11 @@ exit($exit);
 function login(string $host, int $port, string $user = "", string $password = "", ?string &$base_url = null): string
 {
     $hash = sha1("$host$port$user$password");
-    $store_file = TICKET_STORE_DIR . "/$hash";
+    if (is_writable(TICKET_STORE_DIR)) {
+        $store_file = TICKET_STORE_DIR . "/$hash";
+    } else {
+        $store_file = sys_get_temp_dir() . "/$hash";
+    }
     $data = file_exists($store_file) ? stat($store_file) : false;
     if ($data !== false && time() - $data["mtime"] < 3600) {
         [$ticket, $base_url] = explode("|", file_get_contents($store_file));
@@ -232,7 +236,7 @@ function login(string $host, int $port, string $user = "", string $password = ""
         }
     }
 
-    if ($data["serviceTicket"]) {
+    if (isset($data["serviceTicket"])) {
         $base_url = str_replace("/serviceTicket", "", $url);
         file_put_contents($store_file, $data["serviceTicket"] . "|" . $base_url);
 
